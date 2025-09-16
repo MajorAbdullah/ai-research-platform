@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Vercel-compatible FastAPI Web Interface for OpenAI Research Client
-Full-featured version matching the original app.py
+FastAPI Web Interface for OpenAI Research Client
+Local hosting optimized version
 """
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks
