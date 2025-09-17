@@ -209,7 +209,7 @@ class ResearchWorkflow:
         
         return tools
     
-    def validate_idea(self, idea: str, model: str = "o4-mini-deep-research") -> Dict[str, Any]:
+    def validate_idea(self, idea: str, model: str = "o4-mini-deep-research", max_citations: int = 15) -> Dict[str, Any]:
         """
         Validate a startup or product idea following the template structure
         """
@@ -218,7 +218,7 @@ class ResearchWorkflow:
 
         {idea}
 
-        Provide a comprehensive validation report following this structure:
+        Provide a comprehensive validation report with exactly {max_citations} citations from credible sources. Following this structure:
 
         ## 1. Idea Restatement
         - Restate the idea clearly in simple terms
@@ -267,7 +267,7 @@ class ResearchWorkflow:
         
         return {"type": "idea_validation", "status": "failed", "response": response}
     
-    def market_research(self, idea: str, model: str = "o3-deep-research") -> Dict[str, Any]:
+    def market_research(self, idea: str, model: str = "o3-deep-research", max_citations: int = 15) -> Dict[str, Any]:
         """
         Conduct comprehensive market research for a product idea
         """
@@ -276,7 +276,7 @@ class ResearchWorkflow:
 
         {idea}
 
-        Generate a detailed market research report with the following sections:
+        Generate a detailed market research report with exactly {max_citations} citations from credible industry sources, market reports, and research studies. Include the following sections:
 
         ## 1. Idea Summary
         - Restate the idea clearly in plain language
@@ -343,7 +343,7 @@ class ResearchWorkflow:
         
         return {"type": "market_research", "status": "failed", "response": response}
     
-    def financial_analysis(self, idea: str, model: str = "o3-deep-research") -> Dict[str, Any]:
+    def financial_analysis(self, idea: str, model: str = "o3-deep-research", max_citations: int = 15) -> Dict[str, Any]:
         """
         Conduct comprehensive financial analysis for a startup idea
         """
@@ -353,7 +353,7 @@ class ResearchWorkflow:
 
         {idea}
 
-        Generate a detailed financial analysis report with the following sections:
+        Generate a detailed financial analysis report with exactly {max_citations} citations from credible financial sources, market data, industry reports, and case studies. Include the following sections:
 
         ## 1. Idea Summary
         - Restate the idea briefly in financial context
@@ -443,15 +443,18 @@ class ResearchWorkflow:
         return results
     
     def custom_research(self, query: str, model: str = "o3-deep-research", 
-                       research_type: str = "general", enrich_prompt: bool = True) -> Dict[str, Any]:
+                       research_type: str = "general", enrich_prompt: bool = True, max_citations: int = 15) -> Dict[str, Any]:
         """
-        Conduct custom research with optional prompt enrichment
+        Conduct custom research with optional prompt enrichment and citation control
         """
         research_prompt = query
         
         if enrich_prompt:
             print("Enriching prompt...")
             research_prompt = self.client.enrich_prompt(query, research_type)
+        
+        # Add citation requirement to the prompt
+        research_prompt += f"\n\nIMPORTANT: Include exactly {max_citations} citations from credible sources in your research. Use proper citation format with links where possible."
         
         tools = self._prepare_tools(use_web_search=True, use_code_interpreter=True)
         

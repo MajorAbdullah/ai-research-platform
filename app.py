@@ -8,17 +8,82 @@ from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional, Dict, Any, List
 import json
 import asyncio
 import uuid
 from datetime import datetime
 import os
+import sqlite3
+import re
+import concurrent.futures
+import uvicorn
+from pathlib import Path
 from services.research_client import OpenAIResearchClient, ResearchWorkflow
 from services.storage_service import storage_service
+from models.database import SessionLocal, ResearchTask, ResearchResult, init_database
+from sqlalchemy.orm import Session
 
-app = FastAPI(title="OpenAI Research Interface", version="1.0.0")
+# Get the project root directory (cloud optimized)
+PROJECT_ROOT = Path(__file__).parent.absolute()
+TEMPLATES_DIR = PROJECT_ROOT / "templates"
+
+# FastAPI app with comprehensive documentation
+app = FastAPI(
+    title="AI Research Platform API",
+    description="""
+    🔬 **AI Research Platform** - Comprehensive research automation platform powered by OpenAI models.
+    
+    ## Features
+    
+    * **Multi-type Research**: Custom, validation, market, financial, and comprehensive research
+    * **Model Selection**: Support for various OpenAI models including O3 Deep Research
+    * **Task Management**: Asynchronous research task processing with real-time status tracking
+    * **Document Storage**: Organized research document management with metadata
+    * **Dashboard Analytics**: Research metrics and portfolio management
+    * **Health Monitoring**: System health and performance monitoring
+    
+    ## Research Types
+    
+    * **Custom**: General-purpose research on any topic
+    * **Validation**: Business idea validation and feasibility analysis  
+    * **Market**: Market analysis and competitive intelligence
+    * **Financial**: Financial analysis and investment research
+    * **Comprehensive**: Deep, multi-faceted research with extensive analysis
+    
+    ## Getting Started
+    
+    1. Check system health at `/health`
+    2. Browse available models at `/api/models`
+    3. Submit research requests to `/api/research`
+    4. Monitor progress with `/api/research/{task_id}/status`
+    5. Retrieve results from `/api/research/{task_id}/result`
+    
+    ## Web Interface
+    
+    Access the full web interface at the root URL for an intuitive research experience.
+    """,
+    version="2.0.0",
+    contact={
+        "name": "AI Research Platform",
+        "url": "https://github.com/MajorAbdullah/ai-research-platform",
+    },
+    license_info={
+        "name": "MIT License",
+        "url": "https://opensource.org/licenses/MIT",
+    },
+    docs_url="/api/docs",  # Swagger UI
+    redoc_url="/api/redoc",  # ReDoc documentation
+)
+
+@app.on_event("startup")
+async def startup_event():
+    """Handle application startup events"""
+    print("\n🚀 AI Research Platform starting up...")
+    print("   Loading previous research results...")
+    # Results are already loaded during import, but we can add additional startup logic here
+    print("✅ Startup complete - Server ready to accept requests")
 
 # Add CORS middleware
 app.add_middleware(
@@ -33,6 +98,78 @@ app.add_middleware(
 research_tasks = {}
 completed_results = {}
 
+def load_previous_results():
+    """Load and display all previous research results from database"""
+    try:
+        # Initialize database if it doesn't exist
+        init_database()
+        
+        # Get database session
+        db = SessionLocal()
+        
+        # Query all completed research tasks
+        completed_tasks = db.query(ResearchTask).filter(
+            ResearchTask.status == "completed"
+        ).order_by(ResearchTask.completed_at.desc()).all()
+        
+        if not completed_tasks:
+            print("\n📊 No previous research results found.")
+            print("   Ready to start your first research project!")
+            db.close()
+            return
+        
+        print(f"\n📊 Found {len(completed_tasks)} previous research results:")
+        print("=" * 80)
+        
+        for i, task in enumerate(completed_tasks, 1):
+            # Calculate processing time
+            processing_time = "Unknown"
+            if task.started_at and task.completed_at:
+                duration = task.completed_at - task.started_at
+                processing_time = f"{duration.total_seconds():.1f}s"
+            
+            # Get word count and citations from result data
+            word_count = 0
+            citations = 0
+            if task.result_data:
+                word_count = task.result_data.get('word_count', 0)
+                citations = task.result_data.get('citations', 0)
+            
+            print(f"\n{i:2d}. 📝 {task.query[:60]}{'...' if len(task.query) > 60 else ''}")
+            print(f"    🆔 Task ID: {task.task_id}")
+            print(f"    📊 Type: {task.research_type.title()} | Model: {task.model}")
+            print(f"    ⏱️  Completed: {task.completed_at.strftime('%Y-%m-%d %H:%M:%S') if task.completed_at else 'Unknown'}")
+            print(f"    📈 Processing Time: {processing_time} | Words: {word_count:,} | Citations: {citations}")
+            if task.md_document_path:
+                print(f"    📄 Document: {task.md_document_path}")
+            
+            # Load result into completed_results for API access
+            if task.result_data:
+                completed_results[task.task_id] = {
+                    "task_id": task.task_id,
+                    "status": "completed",
+                    "query": task.query,
+                    "model": task.model,
+                    "research_type": task.research_type,
+                    "result": task.result_data,
+                    "completed_at": task.completed_at.isoformat() if task.completed_at else None,
+                    "processing_time": processing_time,
+                    "md_document_path": task.md_document_path
+                }
+        
+        print("=" * 80)
+        print(f"✅ Loaded {len(completed_results)} research results into memory")
+        print("   All previous results are now accessible via API endpoints\n")
+        
+        db.close()
+        
+    except Exception as e:
+        print(f"❌ Error loading previous results: {e}")
+        print("   Continuing with empty result set...")
+
+# Initialize database and load previous results
+load_previous_results()
+
 # Initialize research client
 try:
     research_client = OpenAIResearchClient()
@@ -44,31 +181,57 @@ except Exception as e:
     research_workflow = None
 
 class ResearchRequest(BaseModel):
-    query: str
-    model: str = "o3-deep-research"
-    research_type: str = "custom"  # custom, validation, market, financial, comprehensive
-    enrich_prompt: bool = True
+    """Research request model for submitting research tasks"""
+    query: str = Field(
+        ..., 
+        description="Research query or topic to investigate",
+        example="AI applications in renewable energy storage"
+    )
+    model: str = Field(
+        default="o3-deep-research",
+        description="OpenAI model to use for research",
+        example="o3-deep-research"
+    )
+    research_type: str = Field(
+        default="custom",
+        description="Type of research to conduct",
+        enum=["custom", "validation", "market", "financial", "comprehensive"],
+        example="market"
+    )
+    enrich_prompt: bool = Field(
+        default=True,
+        description="Whether to enhance the query with additional context and formatting"
+    )
+    max_citations: int = Field(
+        default=15,
+        description="Maximum number of citations/sources to include in the research (5-100)",
+        ge=5,
+        le=100,
+        example=20
+    )
 
 class ResearchStatus(BaseModel):
-    task_id: str
-    status: str  # pending, running, completed, failed
-    created_at: str
-    query: str
-    model: str
-    research_type: str
-    progress: Optional[str] = None
-    error: Optional[str] = None
+    """Research task status information"""
+    task_id: str = Field(..., description="Unique identifier for the research task")
+    status: str = Field(..., description="Current status of the research task", enum=["pending", "running", "completed", "failed"])
+    created_at: str = Field(..., description="Timestamp when the task was created")
+    query: str = Field(..., description="Original research query")
+    model: str = Field(..., description="OpenAI model being used")
+    research_type: str = Field(..., description="Type of research being conducted")
+    progress: Optional[str] = Field(None, description="Current progress information")
+    error: Optional[str] = Field(None, description="Error message if task failed")
 
 class ResearchResult(BaseModel):
-    task_id: str
-    status: str
-    query: str
-    model: str
-    research_type: str
-    result: Optional[Dict[str, Any]] = None
-    created_at: str
-    completed_at: Optional[str] = None
-    error: Optional[str] = None
+    """Complete research result with metadata"""
+    task_id: str = Field(..., description="Unique identifier for the research task")
+    status: str = Field(..., description="Final status of the research task")
+    query: str = Field(..., description="Original research query")
+    model: str = Field(..., description="OpenAI model used")
+    research_type: str = Field(..., description="Type of research conducted")
+    result: Optional[Dict[str, Any]] = Field(None, description="Research results including analysis, citations, and metadata")
+    created_at: str = Field(..., description="Timestamp when the task was created")
+    completed_at: Optional[str] = Field(None, description="Timestamp when the task completed")
+    error: Optional[str] = Field(None, description="Error message if task failed")
 
 def extract_citations(text: str) -> int:
     """Extract citation count from research text"""
@@ -123,69 +286,163 @@ def format_research_output(result: Dict[str, Any], research_type: str) -> Dict[s
         "word_count": word_count
     }
 
+import asyncio
+import concurrent.futures
+
 def run_progressive_comprehensive_research(task_id: str, request: ResearchRequest) -> Dict[str, Any]:
-    """Run comprehensive research with progressive updates"""
-    comprehensive_result = {
-        "type": "comprehensive",
-        "sections": {},
-        "progress": {},
-        "total_citations": 0,
-        "total_words": 0
+    """Run comprehensive research with parallel execution for faster results"""
+    
+    # Initialize progress tracking
+    research_tasks[task_id]["progress"] = "🚀 Starting parallel comprehensive research (3 phases simultaneously)..."
+    
+    # Define research functions with citation control
+    def run_validation():
+        return research_workflow.validate_idea(request.query, request.model, request.max_citations)
+    
+    def run_market():
+        return research_workflow.market_research(request.query, request.model, request.max_citations)
+    
+    def run_financial():
+        return research_workflow.financial_analysis(request.query, request.model, request.max_citations)
+    
+    # Track parallel execution progress
+    progress_status = {
+        "validation": "running",
+        "market": "running", 
+        "financial": "running"
     }
     
-    # Step 1: Validation
-    research_tasks[task_id]["progress"] = "Step 1/3: Running idea validation analysis..."
-    validation_result = research_workflow.validate_idea(request.query, request.model)
+    research_tasks[task_id]["progress"] = "⚡ Running validation, market, and financial analysis in parallel..."
     
-    if validation_result.get("status") == "completed":
-        formatted_validation = format_research_output(validation_result, "validation")
-        comprehensive_result["sections"]["validation"] = formatted_validation
-        comprehensive_result["progress"]["validation"] = "completed"
+    # Execute all three research types in parallel using ThreadPoolExecutor
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+        # Submit all tasks
+        future_validation = executor.submit(run_validation)
+        future_market = executor.submit(run_market)
+        future_financial = executor.submit(run_financial)
         
-        # Update live result for progressive display
-        research_tasks[task_id]["partial_result"] = comprehensive_result.copy()
-        research_tasks[task_id]["progress"] = "Validation completed! Starting market research..."
+        # Wait for completion and collect results
+        results = {}
+        
+        # Collect validation result
+        try:
+            validation_result = future_validation.result()
+            results["validation"] = format_research_output(validation_result, "validation")
+            progress_status["validation"] = "completed"
+        except Exception as e:
+            print(f"Validation research failed: {e}")
+            results["validation"] = {"status": "failed", "error": str(e)}
+        
+        # Collect market result
+        try:
+            market_result = future_market.result()
+            results["market"] = format_research_output(market_result, "market")
+            progress_status["market"] = "completed"
+        except Exception as e:
+            print(f"Market research failed: {e}")
+            results["market"] = {"status": "failed", "error": str(e)}
+        
+        # Collect financial result
+        try:
+            financial_result = future_financial.result()
+            results["financial"] = format_research_output(financial_result, "financial")
+            progress_status["financial"] = "completed"
+        except Exception as e:
+            print(f"Financial research failed: {e}")
+            results["financial"] = {"status": "failed", "error": str(e)}
     
-    # Step 2: Market Research
-    research_tasks[task_id]["progress"] = "Step 2/3: Conducting market research analysis..."
-    market_result = research_workflow.market_research(request.query, request.model)
+    # Calculate totals
+    total_citations = sum(
+        section.get("citations", 0) 
+        for section in results.values() 
+        if isinstance(section, dict)
+    )
+    total_words = sum(
+        section.get("word_count", 0) 
+        for section in results.values()
+        if isinstance(section, dict)
+    )
     
-    if market_result.get("status") == "completed":
-        formatted_market = format_research_output(market_result, "market")
-        comprehensive_result["sections"]["market"] = formatted_market
-        comprehensive_result["progress"]["market"] = "completed"
-        
-        # Update live result for progressive display
-        research_tasks[task_id]["partial_result"] = comprehensive_result.copy()
-        research_tasks[task_id]["progress"] = "Market research completed! Starting financial analysis..."
+    # Create unified comprehensive result
+    comprehensive_result = {
+        "type": "comprehensive",
+        "sections": results,
+        "progress": progress_status,
+        "total_citations": total_citations,
+        "total_words": total_words,
+        "execution_mode": "parallel",
+        "unified_content": create_unified_comprehensive_document(results, request.query)
+    }
     
-    # Step 3: Financial Analysis
-    research_tasks[task_id]["progress"] = "Step 3/3: Executing financial analysis..."
-    financial_result = research_workflow.financial_analysis(request.query, request.model)
-    
-    if financial_result.get("status") == "completed":
-        formatted_financial = format_research_output(financial_result, "financial")
-        comprehensive_result["sections"]["financial"] = formatted_financial
-        comprehensive_result["progress"]["financial"] = "completed"
-        
-        # Calculate totals
-        total_citations = sum(
-            section.get("citations", 0) 
-            for section in comprehensive_result["sections"].values()
-        )
-        total_words = sum(
-            section.get("word_count", 0) 
-            for section in comprehensive_result["sections"].values()
-        )
-        
-        comprehensive_result["total_citations"] = total_citations
-        comprehensive_result["total_words"] = total_words
-        
-        # Final update
-        research_tasks[task_id]["partial_result"] = comprehensive_result.copy()
-        research_tasks[task_id]["progress"] = "All research completed! Generating final report..."
+    # Final progress update
+    completed_count = sum(1 for status in progress_status.values() if status == "completed")
+    research_tasks[task_id]["progress"] = f"✅ Parallel execution completed! {completed_count}/3 phases successful. Generating unified document..."
     
     return comprehensive_result
+
+def create_unified_comprehensive_document(results: Dict[str, Any], query: str) -> str:
+    """Create a single unified document from all comprehensive research results"""
+    
+    unified_content = f"""# Comprehensive Research Report: {query}
+
+## Executive Summary
+
+This comprehensive analysis examines the business opportunity from three critical perspectives: idea validation, market analysis, and financial viability. All research phases were conducted simultaneously for maximum efficiency and cross-validation of insights.
+
+"""
+    
+    # Add validation section
+    if "validation" in results and results["validation"].get("formatted_output"):
+        unified_content += f"""## 🔍 Business Idea Validation
+
+{results["validation"]["formatted_output"]}
+
+---
+
+"""
+    
+    # Add market research section
+    if "market" in results and results["market"].get("formatted_output"):
+        unified_content += f"""## 📊 Market Research & Analysis
+
+{results["market"]["formatted_output"]}
+
+---
+
+"""
+    
+    # Add financial analysis section
+    if "financial" in results and results["financial"].get("formatted_output"):
+        unified_content += f"""## 💰 Financial Analysis & Projections
+
+{results["financial"]["formatted_output"]}
+
+---
+
+"""
+    
+    # Add comprehensive conclusion
+    unified_content += f"""## 🎯 Comprehensive Conclusion & Recommendations
+
+Based on the parallel analysis across validation, market research, and financial assessment:
+
+### Key Findings Summary
+- **Validation Score**: Based on market need, solution fit, and competitive positioning
+- **Market Opportunity**: Total addressable market size and growth potential  
+- **Financial Viability**: Revenue projections, costs, and ROI analysis
+
+### Strategic Recommendations
+The convergence of insights from all three research phases provides a robust foundation for decision-making. This unified analysis enables confident strategic planning with validated assumptions across multiple business dimensions.
+
+### Next Steps
+1. **Immediate Actions**: Based on validation findings
+2. **Market Entry Strategy**: Leveraging market research insights
+3. **Financial Planning**: Implementing financial projections and milestones
+
+*This comprehensive report was generated using parallel research execution for maximum efficiency and insight integration.*
+"""
+    
+    return unified_content
 
 def background_research_task(task_id: str, request: ResearchRequest):
     """Background task for conducting research"""
@@ -204,15 +461,15 @@ def background_research_task(task_id: str, request: ResearchRequest):
         if request.research_type == "validation":
             research_tasks[task_id]["progress"] = "Conducting idea validation analysis..."
             storage_service.update_research_task(task_id, {"progress": "Conducting idea validation analysis..."})
-            result = research_workflow.validate_idea(request.query, request.model)
+            result = research_workflow.validate_idea(request.query, request.model, request.max_citations)
         elif request.research_type == "market":
             research_tasks[task_id]["progress"] = "Performing market research analysis..."
             storage_service.update_research_task(task_id, {"progress": "Performing market research analysis..."})
-            result = research_workflow.market_research(request.query, request.model)
+            result = research_workflow.market_research(request.query, request.model, request.max_citations)
         elif request.research_type == "financial":
             research_tasks[task_id]["progress"] = "Executing financial analysis..."
             storage_service.update_research_task(task_id, {"progress": "Executing financial analysis..."})
-            result = research_workflow.financial_analysis(request.query, request.model)
+            result = research_workflow.financial_analysis(request.query, request.model, request.max_citations)
         elif request.research_type == "comprehensive":
             # Progressive comprehensive research
             result = run_progressive_comprehensive_research(task_id, request)
@@ -223,7 +480,8 @@ def background_research_task(task_id: str, request: ResearchRequest):
                 request.query, 
                 request.model, 
                 "general", 
-                request.enrich_prompt
+                request.enrich_prompt,
+                request.max_citations
             )
         
         end_time = datetime.now()
@@ -273,603 +531,166 @@ def background_research_task(task_id: str, request: ResearchRequest):
             "progress": f"Research failed: {str(e)}"
         })
 
-@app.get("/", response_class=HTMLResponse)
+@app.get(
+    "/", 
+    response_class=HTMLResponse,
+    summary="Web Interface",
+    description="Serve the main web interface for the AI Research Platform",
+    response_description="HTML web interface for interactive research",
+    tags=["Web Interface"]
+)
 async def home():
-    """Serve the main web interface"""
-    return """
-    <!DOCTYPE html>
-    <html lang="en">
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>OpenAI Research Interface</title>
-        <script src="https://cdn.tailwindcss.com"></script>
-        <script src="https://unpkg.com/alpinejs@3.x.x/dist/cdn.min.js" defer></script>
-    </head>
-    <body class="bg-gray-50 min-h-screen">
-        <div x-data="researchApp()" class="container mx-auto px-4 py-8">
-            <!-- Header -->
-            <div class="text-center mb-8">
-                <h1 class="text-4xl font-bold text-gray-900 mb-2">OpenAI Research Interface</h1>
-                <p class="text-gray-600">Conduct comprehensive research using advanced AI models</p>
-            </div>
-
-            <!-- Model Selection & Research Form -->
-            <div class="bg-white rounded-lg shadow-md p-6 mb-8">
-                <form @submit.prevent="submitResearch()" class="space-y-6">
-                    <div>
-                        <label class="block text-sm font-medium text-gray-700 mb-2">Select Research Model</label>
-                        <select x-model="selectedModel" class="w-full border border-gray-300 rounded-md px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500">
-                            <template x-for="model in models" :key="model.id">
-                                <option :value="model.id" x-text="model.name"></option>
-                            </template>
-                        </select>
-                        <div x-show="selectedModelInfo" class="mt-2 p-3 bg-blue-50 rounded-md">
-                            <p class="text-sm text-blue-800" x-text="selectedModelInfo?.description"></p>
-                            <div class="mt-1 text-xs text-blue-600">
-                                <span x-text="'Best for: ' + selectedModelInfo?.best_for"></span> |
-                                <span x-text="'Cost: ' + selectedModelInfo?.cost"></span> |
-                                <span x-text="'Speed: ' + selectedModelInfo?.speed"></span>
-                            </div>
-                        </div>
-                    </div>
-
-                    <div>
-                        <label class="block text-sm font-medium text-gray-700 mb-2">Research Type</label>
-                        <select x-model="researchType" class="w-full border border-gray-300 rounded-md px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500">
-                            <option value="custom">Custom Research</option>
-                            <option value="validation">Idea Validation</option>
-                            <option value="market">Market Research</option>
-                            <option value="financial">Financial Analysis</option>
-                            <option value="comprehensive">Comprehensive Analysis (All Three)</option>
-                        </select>
-                    </div>
-
-                    <div>
-                        <label class="block text-sm font-medium text-gray-700 mb-2">Research Query</label>
-                        <textarea 
-                            x-model="query" 
-                            rows="4" 
-                            class="w-full border border-gray-300 rounded-md px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
-                            placeholder="Enter your research question or startup idea...">
-                        </textarea>
-                    </div>
-
-                    <div class="flex items-center">
-                        <input type="checkbox" x-model="enrichPrompt" class="h-4 w-4 text-blue-600 focus:ring-blue-500 border-gray-300 rounded">
-                        <label class="ml-2 block text-sm text-gray-700">Enrich prompt automatically (recommended)</label>
-                    </div>
-
-                    <button 
-                        type="submit" 
-                        :disabled="!query || isLoading"
-                        class="w-full bg-blue-600 text-white py-2 px-4 rounded-md hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-50 disabled:cursor-not-allowed">
-                        <span x-show="!isLoading">Start Research</span>
-                        <span x-show="isLoading">Starting Research...</span>
-                    </button>
-                </form>
-            </div>
-
-            <!-- Research Status -->
-            <div x-show="currentTask" class="bg-white rounded-lg shadow-md p-6 mb-8">
-                <h3 class="text-lg font-semibold mb-4">Research Progress</h3>
-                
-                <!-- Progress Steps -->
-                <div class="mb-6">
-                    <div class="flex items-center justify-between mb-2">
-                        <span class="text-sm font-medium">Progress</span>
-                        <span class="text-sm text-gray-600" x-text="getProgressPercentage() + '%'"></span>
-                    </div>
-                    <div class="w-full bg-gray-200 rounded-full h-3">
-                        <div class="bg-gradient-to-r from-blue-500 to-blue-600 h-3 rounded-full transition-all duration-1000 ease-out" 
-                             :style="'width: ' + getProgressPercentage() + '%'"></div>
-                    </div>
-                </div>
-
-                <!-- Step Indicators -->
-                <div class="space-y-3 mb-4">
-                    <div class="flex items-center space-x-3">
-                        <div class="flex-shrink-0 w-8 h-8 rounded-full flex items-center justify-center" 
-                             :class="getStepClass(1)">
-                            <span x-show="getStepNumber() > 1" class="text-white text-sm">✓</span>
-                            <span x-show="getStepNumber() === 1" class="w-3 h-3 bg-white rounded-full animate-pulse"></span>
-                            <span x-show="getStepNumber() < 1" class="text-gray-400 text-sm">1</span>
-                        </div>
-                        <div class="flex-1">
-                            <p class="text-sm font-medium" :class="getStepNumber() >= 1 ? 'text-gray-900' : 'text-gray-400'">
-                                Initialize Research
-                            </p>
-                            <p class="text-xs text-gray-500">Setting up AI models and preparing query</p>
-                        </div>
-                    </div>
-
-                    <div class="flex items-center space-x-3">
-                        <div class="flex-shrink-0 w-8 h-8 rounded-full flex items-center justify-center" 
-                             :class="getStepClass(2)">
-                            <span x-show="getStepNumber() > 2" class="text-white text-sm">✓</span>
-                            <span x-show="getStepNumber() === 2" class="w-3 h-3 bg-white rounded-full animate-pulse"></span>
-                            <span x-show="getStepNumber() < 2" class="text-gray-400 text-sm">2</span>
-                        </div>
-                        <div class="flex-1">
-                            <p class="text-sm font-medium" :class="getStepNumber() >= 2 ? 'text-gray-900' : 'text-gray-400'">
-                                Data Collection
-                            </p>
-                            <p class="text-xs text-gray-500">Gathering information from multiple sources</p>
-                        </div>
-                    </div>
-
-                    <div class="flex items-center space-x-3">
-                        <div class="flex-shrink-0 w-8 h-8 rounded-full flex items-center justify-center" 
-                             :class="getStepClass(3)">
-                            <span x-show="getStepNumber() > 3" class="text-white text-sm">✓</span>
-                            <span x-show="getStepNumber() === 3" class="w-3 h-3 bg-white rounded-full animate-pulse"></span>
-                            <span x-show="getStepNumber() < 3" class="text-gray-400 text-sm">3</span>
-                        </div>
-                        <div class="flex-1">
-                            <p class="text-sm font-medium" :class="getStepNumber() >= 3 ? 'text-gray-900' : 'text-gray-400'">
-                                Analysis & Processing
-                            </p>
-                            <p class="text-xs text-gray-500">AI analysis and report generation</p>
-                        </div>
-                    </div>
-
-                    <div class="flex items-center space-x-3">
-                        <div class="flex-shrink-0 w-8 h-8 rounded-full flex items-center justify-center" 
-                             :class="getStepClass(4)">
-                            <span x-show="getStepNumber() > 4" class="text-white text-sm">✓</span>
-                            <span x-show="getStepNumber() === 4" class="w-3 h-3 bg-white rounded-full animate-pulse"></span>
-                            <span x-show="getStepNumber() < 4" class="text-gray-400 text-sm">4</span>
-                        </div>
-                        <div class="flex-1">
-                            <p class="text-sm font-medium" :class="getStepNumber() >= 4 ? 'text-gray-900' : 'text-gray-400'">
-                                Final Report
-                            </p>
-                            <p class="text-xs text-gray-500">Formatting and finalizing results</p>
-                        </div>
-                    </div>
-                </div>
-
-                <!-- Current Status -->
-                <div class="bg-blue-50 rounded-lg p-4">
-                    <div class="flex items-center space-x-2">
-                        <div x-show="currentTask?.status === 'running'" class="flex-shrink-0">
-                            <div class="animate-spin w-4 h-4 border-2 border-blue-600 border-t-transparent rounded-full"></div>
-                        </div>
-                        <div>
-                            <p class="text-sm font-medium text-blue-900" x-text="currentTask?.progress || 'Processing...'"></p>
-                            <p class="text-xs text-blue-700">
-                                <span x-text="'Model: ' + (currentTask?.model || 'Unknown')"></span> • 
-                                <span x-text="'Type: ' + (currentTask?.research_type || 'custom')"></span>
-                            </p>
-                        </div>
-                    </div>
-                </div>
-            </div>
-
-            <!-- Research Results -->
-            <div x-show="results.length > 0" class="space-y-6">
-                <h2 class="text-2xl font-bold text-gray-900">Research Results</h2>
-                <template x-for="result in results" :key="result.task_id">
-                    <div class="bg-white rounded-lg shadow-md overflow-hidden">
-                        <!-- Result Header -->
-                        <div class="bg-gradient-to-r from-blue-50 to-indigo-50 px-6 py-4 border-b">
-                            <div class="flex items-center justify-between mb-2">
-                                <h3 class="text-lg font-semibold text-gray-900" x-text="result.query"></h3>
-                                <div class="flex items-center space-x-2">
-                                    <span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-blue-100 text-blue-800" 
-                                          x-text="result.model"></span>
-                                    <span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-green-100 text-green-800" 
-                                          x-text="result.research_type"></span>
-                                </div>
-                            </div>
-                            
-                            <!-- Metadata Row -->
-                            <div class="flex items-center justify-between text-sm text-gray-600">
-                                <div class="flex items-center space-x-4">
-                                    <span x-show="result.result?.processing_time_formatted" class="flex items-center space-x-1">
-                                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"></path>
-                                        </svg>
-                                        <span x-text="result.result.processing_time_formatted"></span>
-                                    </span>
-                                    <span x-show="getCitationCount(result)" class="flex items-center space-x-1">
-                                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"></path>
-                                        </svg>
-                                        <span x-text="getCitationCount(result) + ' citations'"></span>
-                                    </span>
-                                    <span x-show="getWordCount(result)" class="flex items-center space-x-1">
-                                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"></path>
-                                        </svg>
-                                        <span x-text="getWordCount(result) + ' words'"></span>
-                                    </span>
-                                </div>
-                                <span class="text-xs" x-text="'Completed: ' + new Date(result.completed_at).toLocaleString()"></span>
-                            </div>
-                        </div>
-
-                        <!-- Result Content -->
-                        <div class="p-6">
-                            <div x-show="result.status === 'completed' && result.result">
-                                <!-- Comprehensive Research Display -->
-                                <div x-show="result.research_type === 'comprehensive'" class="space-y-6">
-                                    <template x-for="(section, sectionName) in result.result?.sections || {}" :key="sectionName">
-                                        <div class="border border-gray-200 rounded-lg">
-                                            <div class="bg-gray-50 px-4 py-3 border-b">
-                                                <h4 class="font-medium text-gray-900 capitalize" x-text="sectionName.replace('_', ' ')"></h4>
-                                                <div class="flex items-center space-x-3 text-sm text-gray-600 mt-1">
-                                                    <span x-show="section.citations" x-text="section.citations + ' citations'"></span>
-                                                    <span x-show="section.word_count" x-text="section.word_count + ' words'"></span>
-                                                </div>
-                                            </div>
-                                            <div class="p-4 max-h-64 overflow-y-auto">
-                                                <div class="prose prose-sm max-w-none" x-html="formatMarkdown(section.formatted_output || section.output)"></div>
-                                            </div>
-                                        </div>
-                                    </template>
-                                </div>
-
-                                <!-- Single Research Display -->
-                                <div x-show="result.research_type !== 'comprehensive'" class="max-h-96 overflow-y-auto">
-                                    <div class="prose prose-sm max-w-none" x-html="formatMarkdown(result.result?.formatted_output || result.result?.output || formatResult(result.result))"></div>
-                                </div>
-
-                                <!-- Action Buttons -->
-                                <div class="mt-6 flex space-x-3">
-                                    <button 
-                                        @click="downloadResult(result)"
-                                        class="inline-flex items-center px-4 py-2 bg-green-600 text-white text-sm font-medium rounded-md hover:bg-green-700 focus:outline-none focus:ring-2 focus:ring-green-500 focus:ring-offset-2">
-                                        <svg class="w-4 h-4 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"></path>
-                                        </svg>
-                                        Download Report
-                                    </button>
-                                    <button 
-                                        @click="copyResult(result)"
-                                        class="inline-flex items-center px-4 py-2 bg-gray-600 text-white text-sm font-medium rounded-md hover:bg-gray-700 focus:outline-none focus:ring-2 focus:ring-gray-500 focus:ring-offset-2">
-                                        <svg class="w-4 h-4 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path>
-                                        </svg>
-                                        Copy to Clipboard
-                                    </button>
-                                    <button 
-                                        @click="openDashboard(result)"
-                                        class="inline-flex items-center px-4 py-2 bg-purple-600 text-white text-sm font-medium rounded-md hover:bg-purple-700 focus:outline-none focus:ring-2 focus:ring-purple-500 focus:ring-offset-2">
-                                        <svg class="w-4 h-4 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"></path>
-                                        </svg>
-                                        Open Integrated Dashboard
-                                    </button>
-                                </div>
-                            </div>
-
-                            <div x-show="result.status === 'failed'" class="bg-red-50 border border-red-200 rounded-md p-4">
-                                <div class="flex items-center">
-                                    <svg class="w-5 h-5 text-red-400 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4c-.77-.833-1.964-.833-2.732 0L5.082 16.5c-.77.833.192 2.5 1.732 2.5z"></path>
-                                    </svg>
-                                    <p class="text-red-800 text-sm font-medium">Research Failed</p>
-                                </div>
-                                <p class="text-red-700 text-sm mt-1" x-text="result.error"></p>
-                            </div>
-                        </div>
-                    </div>
-                </template>
-            </div>
-        </div>
-
-        <script>
-            function researchApp() {
-                return {
-                    models: [],
-                    selectedModel: 'o3-deep-research',
-                    researchType: 'custom',
-                    query: '',
-                    enrichPrompt: true,
-                    isLoading: false,
-                    currentTask: null,
-                    results: [],
-
-                    async init() {
-                        await this.loadModels();
-                        this.checkPendingTasks();
-                        // Poll for updates every 5 seconds
-                        setInterval(() => this.checkPendingTasks(), 5000);
-                    },
-
-                    get selectedModelInfo() {
-                        return this.models.find(m => m.id === this.selectedModel);
-                    },
-
-                    async loadModels() {
-                        try {
-                            console.log('Loading models...');
-                            const response = await fetch('/api/models');
-                            console.log('Response status:', response.status);
-                            if (!response.ok) {
-                                throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-                            }
-                            const data = await response.json();
-                            console.log('Models data received:', data);
-                            this.models = Object.entries(data).map(([id, info]) => ({
-                                id,
-                                name: info.name,
-                                description: info.description,
-                                best_for: info.best_for,
-                                cost: info.cost,
-                                speed: info.speed
-                            }));
-                            console.log('Models array:', this.models);
-                        } catch (error) {
-                            console.error('Failed to load models:', error);
-                            // Fallback models if API fails
-                            this.models = [
-                                {
-                                    id: 'o3-deep-research',
-                                    name: 'O3 Deep Research',
-                                    description: 'Most comprehensive research model with advanced reasoning capabilities',
-                                    best_for: 'Complex analysis, detailed reports, comprehensive research',
-                                    cost: 'Higher',
-                                    speed: 'Slower'
-                                },
-                                {
-                                    id: 'o4-mini-deep-research',
-                                    name: 'O4 Mini Deep Research',
-                                    description: 'Faster, cost-effective research model for quicker insights',
-                                    best_for: 'Quick research, initial exploration, cost-sensitive tasks',
-                                    cost: 'Lower',
-                                    speed: 'Faster'
-                                }
-                            ];
-                        }
-                    },
-
-                    async submitResearch() {
-                        if (!this.query.trim()) return;
-
-                        this.isLoading = true;
-                        try {
-                            const response = await fetch('/api/research', {
-                                method: 'POST',
-                                headers: {
-                                    'Content-Type': 'application/json',
-                                },
-                                body: JSON.stringify({
-                                    query: this.query,
-                                    model: this.selectedModel,
-                                    research_type: this.researchType,
-                                    enrich_prompt: this.enrichPrompt
-                                })
-                            });
-
-                            if (response.ok) {
-                                const task = await response.json();
-                                this.currentTask = task;
-                                this.query = '';
-                            } else {
-                                alert('Failed to start research');
-                            }
-                        } catch (error) {
-                            console.error('Error submitting research:', error);
-                            alert('Error submitting research');
-                        } finally {
-                            this.isLoading = false;
-                        }
-                    },
-
-                    async checkPendingTasks() {
-                        if (this.currentTask && (this.currentTask.status === 'pending' || this.currentTask.status === 'running')) {
-                            try {
-                                // For comprehensive research, check progressive results
-                                if (this.currentTask.research_type === 'comprehensive') {
-                                    const progressResponse = await fetch(`/api/research/${this.currentTask.task_id}/progressive`);
-                                    if (progressResponse.ok) {
-                                        const progressData = await progressResponse.json();
-                                        this.currentTask = progressData;
-                                        
-                                        // If there are partial results, add them to results display
-                                        if (progressData.partial_result && progressData.partial_result.sections) {
-                                            this.updateProgressiveResults(progressData);
-                                        }
-                                    }
-                                }
-                                
-                                // Check regular status
-                                const response = await fetch(`/api/research/${this.currentTask.task_id}/status`);
-                                if (response.ok) {
-                                    const status = await response.json();
-                                    this.currentTask = {...this.currentTask, ...status};
-
-                                    if (status.status === 'completed' || status.status === 'failed') {
-                                        await this.loadResults();
-                                        this.currentTask = null;
-                                    }
-                                }
-                            } catch (error) {
-                                console.error('Error checking task status:', error);
-                            }
-                        }
-                    },
-
-                    updateProgressiveResults(progressData) {
-                        // Find existing progressive result or create new one
-                        let existingIndex = this.results.findIndex(r => r.task_id === progressData.task_id);
-                        
-                        const progressiveResult = {
-                            task_id: progressData.task_id,
-                            query: this.currentTask.query,
-                            model: this.currentTask.model,
-                            research_type: 'comprehensive',
-                            status: 'in-progress',
-                            created_at: this.currentTask.created_at,
-                            result: progressData.partial_result
-                        };
-                        
-                        if (existingIndex >= 0) {
-                            // Update existing progressive result
-                            this.results[existingIndex] = progressiveResult;
-                        } else {
-                            // Add new progressive result
-                            this.results.unshift(progressiveResult);
-                        }
-                    },
-
-                    async loadResults() {
-                        try {
-                            const response = await fetch('/api/research/results');
-                            if (response.ok) {
-                                this.results = await response.json();
-                            }
-                        } catch (error) {
-                            console.error('Error loading results:', error);
-                        }
-                    },
-
-                    getProgressPercentage() {
-                        if (!this.currentTask) return 0;
-                        const status = this.currentTask.status;
-                        const progress = this.currentTask.progress || '';
-                        
-                        if (status === 'pending') return 10;
-                        if (status === 'running') {
-                            if (progress.includes('Initializing')) return 25;
-                            if (progress.includes('collecting') || progress.includes('Conducting') || progress.includes('Performing')) return 50;
-                            if (progress.includes('Processing') || progress.includes('analysis')) return 75;
-                            if (progress.includes('Finalizing')) return 90;
-                            return 60;
-                        }
-                        if (status === 'completed') return 100;
-                        return 0;
-                    },
-
-                    getStepNumber() {
-                        if (!this.currentTask) return 0;
-                        const progress = this.currentTask.progress || '';
-                        
-                        if (progress.includes('Initializing')) return 1;
-                        if (progress.includes('collecting') || progress.includes('Conducting') || progress.includes('Performing')) return 2;
-                        if (progress.includes('Processing') || progress.includes('analysis')) return 3;
-                        if (progress.includes('Finalizing') || this.currentTask.status === 'completed') return 4;
-                        return 1;
-                    },
-
-                    getStepClass(stepNumber) {
-                        const current = this.getStepNumber();
-                        if (current > stepNumber) return 'bg-green-500';
-                        if (current === stepNumber) return 'bg-blue-500';
-                        return 'bg-gray-300';
-                    },
-
-                    getCitationCount(result) {
-                        if (result.research_type === 'comprehensive') {
-                            return result.result?.total_citations || 0;
-                        }
-                        return result.result?.citations || 0;
-                    },
-
-                    getWordCount(result) {
-                        if (result.research_type === 'comprehensive') {
-                            return result.result?.total_words || 0;
-                        }
-                        return result.result?.word_count || 0;
-                    },
-
-                    formatMarkdown(text) {
-                        if (!text) return '';
-                        
-                        // Simple markdown to HTML conversion
-                        return text
-                            .replace(/### (.*?)\\n/g, '<h3 class="text-lg font-semibold mt-4 mb-2">$1</h3>')
-                            .replace(/## (.*?)\\n/g, '<h2 class="text-xl font-bold mt-6 mb-3">$1</h2>')
-                            .replace(/# (.*?)\\n/g, '<h1 class="text-2xl font-bold mt-8 mb-4">$1</h1>')
-                            .replace(/\\*\\*(.*?)\\*\\*/g, '<strong>$1</strong>')
-                            .replace(/\\*(.*?)\\*/g, '<em>$1</em>')
-                            .replace(/\\[([^\\]]+)\\]\\(([^)]+)\\)/g, '<a href="$2" class="text-blue-600 underline" target="_blank">$1</a>')
-                            .replace(/\\n- (.*?)(?=\\n|$)/g, '\\n<li class="ml-4">$1</li>')
-                            .replace(/(<li.*?>.*?<\\/li>)/gs, '<ul class="list-disc ml-6 mb-2">$1</ul>')
-                            .replace(/\\n\\n/g, '</p><p class="mb-3">')
-                            .replace(/^/, '<p class="mb-3">')
-                            .replace(/$/, '</p>');
-                    },
-
-                    formatResult(result) {
-                        if (typeof result === 'string') return result;
-                        if (result?.formatted_output) return result.formatted_output;
-                        if (result?.output) return result.output;
-                        return JSON.stringify(result, null, 2);
-                    },
-
-                    downloadResult(result) {
-                        let content = '';
-                        
-                        if (result.research_type === 'comprehensive') {
-                            content = `# Research Report: ${result.query}\n\n`;
-                            content += `**Model:** ${result.model}\n`;
-                            content += `**Processing Time:** ${result.result?.processing_time_formatted}\n`;
-                            content += `**Total Citations:** ${this.getCitationCount(result)}\n`;
-                            content += `**Total Words:** ${this.getWordCount(result)}\n\n`;
-                            content += `---\n\n`;
-                            
-                            for (const [sectionName, section] of Object.entries(result.result?.sections || {})) {
-                                content += `# ${sectionName.replace('_', ' ').toUpperCase()}\n\n`;
-                                content += section.formatted_output || section.output || '';
-                                content += `\n\n---\n\n`;
-                            }
-                        } else {
-                            content = `# Research Report: ${result.query}\n\n`;
-                            content += `**Model:** ${result.model}\n`;
-                            content += `**Type:** ${result.research_type}\n`;
-                            content += `**Processing Time:** ${result.result?.processing_time_formatted}\n`;
-                            content += `**Citations:** ${this.getCitationCount(result)}\n`;
-                            content += `**Words:** ${this.getWordCount(result)}\n\n`;
-                            content += `---\n\n`;
-                            content += this.formatResult(result.result);
-                        }
-                        
-                        const blob = new Blob([content], { type: 'text/markdown' });
-                        const url = URL.createObjectURL(blob);
-                        const a = document.createElement('a');
-                        a.href = url;
-                        a.download = `research_${result.query.substring(0, 30).replace(/[^a-zA-Z0-9]/g, '_')}.md`;
-                        a.click();
-                        URL.revokeObjectURL(url);
-                    },
-
-                    async copyResult(result) {
-                        const content = this.formatResult(result.result);
-                        try {
-                            await navigator.clipboard.writeText(content);
-                            alert('Result copied to clipboard!');
-                        } catch (error) {
-                            console.error('Failed to copy to clipboard:', error);
-                        }
-                    },
-
-                    openDashboard(result) {
-                        // Store result data for dashboard
-                        localStorage.setItem('dashboardData', JSON.stringify(result));
-                        // Open React dashboard in new tab
-                        window.open('http://localhost:8080', '_blank');
-                    }
-                }
-            }
-        </script>
-    </body>
-    </html>
     """
+    Serve the main web interface for the AI Research Platform.
+    
+    Provides a user-friendly interface for:
+    - Submitting research requests
+    - Monitoring task progress
+    - Viewing research results
+    - Managing research portfolio
+    - Previous research results display
+    
+    Returns:
+        HTMLResponse: Complete web interface with interactive features
+    """
+    # Read the template file (cloud optimized path)
+    try:
+        template_path = TEMPLATES_DIR / "index.html"
+        with open(template_path, "r", encoding="utf-8") as f:
+            return f.read()
+    except FileNotFoundError:
+        return f"Template file not found at {template_path}. Please check the templates directory."
+    except Exception as e:
+        return f"Error loading template: {str(e)}"
 
-@app.get("/api/models")
+@app.get("/api/research/previous")
+async def get_previous_results():
+    """Get previous research results for display in web interface"""
+    try:
+        # Use SQLAlchemy ORM for cloud optimization
+        db = SessionLocal()
+        
+        # Query completed research tasks with their results
+        completed_tasks = db.query(ResearchTask).filter(
+            ResearchTask.status == "completed"
+        ).order_by(ResearchTask.completed_at.desc()).limit(10).all()
+        
+        results = []
+        for task in completed_tasks:
+            # Calculate processing time
+            processing_time = "0s"
+            if task.completed_at and task.started_at:
+                duration = task.completed_at - task.started_at
+                total_seconds = int(duration.total_seconds())
+                if total_seconds >= 60:
+                    minutes = total_seconds // 60
+                    seconds = total_seconds % 60
+                    processing_time = f"{minutes}m {seconds}s"
+                else:
+                    processing_time = f"{total_seconds}s"
+            
+            # Extract citations and word count from result_data
+            citations = 0
+            word_count = 0
+            if task.result_data:
+                try:
+                    import json
+                    result_json = json.loads(task.result_data) if isinstance(task.result_data, str) else task.result_data
+                    citations = result_json.get("citations", 0)
+                    word_count = result_json.get("word_count", 0)
+                except:
+                    pass
+            
+            results.append({
+                "id": task.task_id,
+                "query": task.query,
+                "model": task.model,
+                "research_type": task.research_type,
+                "completed_at": task.completed_at.isoformat() if task.completed_at else None,
+                "processing_time": processing_time,
+                "word_count": word_count,
+                "citations": citations,
+                "document_path": task.md_document_path
+            })
+        
+        db.close()
+        return results
+        
+    except Exception as e:
+        print(f"Error loading previous results: {e}")
+        return []
+
+# The embedded HTML template has been moved to templates/index.html for better maintainability
+
+@app.get(
+    "/api/models",
+    summary="Get Available Models",
+    description="Retrieve all available OpenAI models for research tasks",
+    response_description="Dictionary of available models with their capabilities",
+    tags=["Models"]
+)
 async def get_models():
-    """Get available research models"""
+    """
+    Get all available OpenAI models for research tasks.
+    
+    Returns a dictionary containing model information including:
+    - Model names and identifiers
+    - Model capabilities and descriptions
+    - Recommended use cases
+    
+    Raises:
+        HTTPException: If the research client is not properly initialized
+    """
     if not research_client:
         raise HTTPException(status_code=500, detail="Research client not initialized")
     
     return research_client.get_available_models()
 
-@app.post("/api/research")
+@app.post(
+    "/api/research",
+    response_model=ResearchStatus,
+    summary="Start Research Task",
+    description="Submit a new research request with citation control and get a task ID for tracking progress",
+    response_description="Research task status with unique task ID",
+    tags=["Research"]
+)
 async def start_research(request: ResearchRequest, background_tasks: BackgroundTasks):
-    """Start a new research task"""
+    """
+    Start a new research task with the specified parameters.
+    
+    This endpoint creates a new research task that runs asynchronously in the background.
+    You can track the progress using the returned task_id.
+    
+    **Research Types:**
+    - **custom**: General-purpose research on any topic
+    - **validation**: Business idea validation and feasibility analysis
+    - **market**: Market analysis and competitive intelligence  
+    - **financial**: Financial analysis and investment research
+    - **comprehensive**: Deep, multi-faceted research with **parallel execution** for faster results
+    
+    **Citation Control:**
+    Specify how many citations/sources you want in your research (5-100):
+    - **5-10**: Quick overview with key sources
+    - **15-25**: Balanced research with good source coverage  
+    - **30-50**: In-depth research with extensive references
+    - **50-100**: Comprehensive research with maximum source validation
+    
+    **Process:**
+    1. Task is created with a unique ID
+    2. Research runs asynchronously in the background
+    3. For comprehensive research, all phases run in **parallel** for speed
+    4. Use `/api/research/{task_id}/status` to check progress
+    5. Retrieve results from `/api/research/{task_id}/result` when completed
+    
+    Args:
+        request: Research request containing query, model, type, citation preferences, and options
+        
+    Returns:
+        ResearchStatus: Initial task status with task_id for tracking
+        
+    Raises:
+        HTTPException: If research client is not initialized
+    """
     if not research_client or not research_workflow:
         raise HTTPException(status_code=500, detail="Research client not initialized")
     
@@ -903,9 +724,33 @@ async def start_research(request: ResearchRequest, background_tasks: BackgroundT
     
     return ResearchStatus(**research_tasks[task_id])
 
-@app.get("/api/research/{task_id}/status")
+@app.get(
+    "/api/research/{task_id}/status",
+    response_model=ResearchStatus,
+    summary="Get Research Status",
+    description="Check the current status and progress of a research task",
+    response_description="Current task status including progress information",
+    tags=["Research"]
+)
 async def get_research_status(task_id: str):
-    """Get the status of a research task"""
+    """
+    Get the current status and progress of a research task.
+    
+    Returns detailed information about the task including:
+    - Current status (pending, running, completed, failed)
+    - Progress information
+    - Task metadata (query, model, research type)
+    - Error information if applicable
+    
+    Args:
+        task_id: Unique identifier for the research task
+        
+    Returns:
+        ResearchStatus: Current status and progress information
+        
+    Raises:
+        HTTPException: If task_id is not found
+    """
     if task_id not in research_tasks:
         raise HTTPException(status_code=404, detail="Task not found")
     
@@ -937,9 +782,33 @@ async def get_progressive_results(task_id: str):
         "research_type": task_data.get("research_type", "comprehensive")
     }
 
-@app.get("/api/research/{task_id}/result")
+@app.get(
+    "/api/research/{task_id}/result",
+    response_model=ResearchResult,
+    summary="Get Research Result",
+    description="Retrieve the complete results of a finished research task",
+    response_description="Complete research results with analysis and metadata",
+    tags=["Research"]
+)
 async def get_research_result(task_id: str):
-    """Get the result of a completed research task"""
+    """
+    Retrieve the complete results of a finished research task.
+    
+    This endpoint returns the full research output including:
+    - Research analysis and findings
+    - Citations and sources
+    - Word count and metadata
+    - Processing time and performance metrics
+    
+    Args:
+        task_id: Unique identifier for the research task
+        
+    Returns:
+        ResearchResult: Complete research results and metadata
+        
+    Raises:
+        HTTPException: If result is not found or task is not yet completed
+    """
     if task_id not in completed_results:
         raise HTTPException(status_code=404, detail="Result not found")
     
@@ -949,6 +818,86 @@ async def get_research_result(task_id: str):
 async def get_all_results():
     """Get all research results"""
     return list(completed_results.values())
+
+@app.get(
+    "/api/research/{task_id}/download",
+    summary="Download Research Document",
+    description="Download the complete research document as a Markdown file",
+    response_description="Markdown file containing the full research report",
+    tags=["Research"]
+)
+async def download_research_document(task_id: str):
+    """
+    Download the complete research document as a Markdown file.
+    
+    This endpoint provides access to the full research document that was
+    generated and saved when the research task was completed.
+    
+    Args:
+        task_id: Unique identifier for the research task
+        
+    Returns:
+        FileResponse: Markdown file download with full research content
+        
+    Raises:
+        HTTPException: If document is not found or task doesn't exist
+    """
+    from fastapi.responses import FileResponse
+    from services.document_manager import research_docs
+    import os
+    
+    # Get document path from document manager
+    doc_path = research_docs.get_document_path(task_id)
+    
+    if not doc_path or not os.path.exists(doc_path):
+        raise HTTPException(status_code=404, detail="Research document not found")
+    
+    # Extract filename for download
+    filename = os.path.basename(doc_path)
+    
+    return FileResponse(
+        path=doc_path,
+        filename=filename,
+        media_type='text/markdown',
+        headers={"Content-Disposition": f"attachment; filename={filename}"}
+    )
+
+@app.get(
+    "/api/research/documents",
+    summary="List Research Documents", 
+    description="Get a list of all saved research documents with metadata",
+    response_description="List of research documents with creation info and download links",
+    tags=["Research"]
+)
+async def list_research_documents(research_type: Optional[str] = None):
+    """
+    Get a list of all saved research documents.
+    
+    Returns metadata for all research documents including:
+    - Document creation date and details
+    - Research type and model used
+    - Download links for full documents
+    - Word count and other metrics
+    
+    Args:
+        research_type: Optional filter by research type (custom, validation, market, financial, comprehensive)
+        
+    Returns:
+        list: List of document metadata with download information
+    """
+    from services.document_manager import research_docs
+    
+    documents = research_docs.list_documents(research_type)
+    
+    # Add download URLs to each document
+    for doc in documents:
+        doc['download_url'] = f"/api/research/{doc['task_id']}/download"
+    
+    return {
+        "documents": documents,
+        "total_count": len(documents),
+        "filter_applied": research_type
+    }
 
 @app.delete("/api/research/{task_id}")
 async def delete_research_result(task_id: str):
@@ -960,9 +909,26 @@ async def delete_research_result(task_id: str):
     
     return {"message": "Result deleted successfully"}
 
-@app.get("/api/dashboard/overview")
+@app.get(
+    "/api/dashboard/overview",
+    summary="Dashboard Overview",
+    description="Get comprehensive dashboard metrics and analytics",
+    response_description="Dashboard overview with research statistics and metrics",
+    tags=["Dashboard"]
+)
 async def get_dashboard_overview():
-    """Get dashboard overview metrics from storage service"""
+    """
+    Get comprehensive dashboard overview with research metrics.
+    
+    Returns key performance indicators including:
+    - Total number of research ideas processed
+    - Average market scores across all research
+    - Number of ideas ready for development
+    - Success rates and performance metrics
+    
+    Returns:
+        dict: Dashboard overview metrics and statistics
+    """
     try:
         # Get real metrics from storage service
         overview = storage_service.get_dashboard_overview()
@@ -1086,9 +1052,23 @@ async def dashboard_page():
     </html>
     """)
 
-@app.get("/health")
+@app.get(
+    "/health",
+    summary="System Health Check",
+    description="Check the health status of the AI Research Platform",
+    response_description="System health information including service status and metrics",
+    tags=["System"]
+)
 async def health_check():
-    """Health check endpoint"""
+    """
+    Check the health status of the AI Research Platform.
+    
+    Returns:
+        - System status (healthy/unhealthy)
+        - Research client initialization status
+        - Number of active research tasks
+        - Number of completed research results
+    """
     return {
         "status": "healthy",
         "research_client_initialized": research_client is not None,

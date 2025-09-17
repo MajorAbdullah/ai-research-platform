@@ -77,14 +77,11 @@ class ResearchDocumentManager:
         folder = self._get_folder_for_type(research_type)
         file_path = folder / filename
         
-        # Extract key information from research data
-        result = research_data.get('result', {})
-        
-        # Generate MD content
+        # Generate MD content (research_data is already the formatted result)
         md_content = self._generate_markdown_content(
             idea_name=idea_name,
             research_type=research_type,
-            research_data=result,
+            research_data=research_data,
             model_used=model_used,
             task_id=task_id
         )
@@ -147,11 +144,26 @@ class ResearchDocumentManager:
         else:
             md_content += self._format_custom_research(research_data)
         
-        # Citations and Sources
-        if 'citations' in research_data:
-            md_content += f"""## Sources and Citations
+        # Research Metrics
+        if 'citations' in research_data or 'word_count' in research_data:
+            md_content += "## 📊 Research Metrics\n\n"
+            
+            if 'citations' in research_data:
+                md_content += f"**Citations Found:** {research_data['citations']}\n"
+            
+            if 'word_count' in research_data:
+                md_content += f"**Word Count:** {research_data['word_count']}\n"
+            
+            if 'processing_time_formatted' in research_data:
+                md_content += f"**Processing Time:** {research_data['processing_time_formatted']}\n"
+            
+            md_content += "\n"
 
-{research_data['citations']}
+        # Sources section if there are citations in the content
+        if research_data.get('citations', 0) > 0:
+            md_content += f"""## 📚 Sources and References
+
+*This research contains {research_data.get('citations', 0)} citations and references from various sources. Sources are embedded within the research content above.*
 
 """
         
@@ -167,25 +179,86 @@ class ResearchDocumentManager:
         """Format comprehensive research results"""
         content = ""
         
-        # Idea Validation Section
-        if 'validation' in data:
-            content += f"""## 🔍 Idea Validation
+        # NEW: Handle unified comprehensive document (parallel execution result)
+        if 'unified_content' in data:
+            # Use the pre-built unified document content
+            content += f"""{data['unified_content']}
+
+## ⚡ Parallel Execution Summary
+
+**Execution Mode**: Parallel (All phases run simultaneously)  
+**Total Citations**: {data.get('total_citations', 0)}  
+**Total Words**: {data.get('total_words', 0)}  
+**Processing Efficiency**: Significantly faster than sequential execution
+
+### Phase Completion Status
+"""
+            # Add completion status for each phase
+            if 'progress' in data:
+                for phase_name, status in data['progress'].items():
+                    status_icon = "✅" if status == "completed" else "❌"
+                    content += f"- **{phase_name.title()}**: {status_icon} {status.title()}\n"
+            
+            content += "\n"
+            
+        # Handle comprehensive research with sections
+        elif 'sections' in data:
+            sections = data['sections']
+            
+            # Idea Validation Section
+            if 'validation' in sections:
+                val_data = sections['validation']
+                content += f"""## 🔍 Idea Validation
+
+"""
+                if 'formatted_output' in val_data:
+                    content += f"{val_data['formatted_output']}\n\n"
+                elif val_data.get('output'):
+                    content += f"{val_data['output']}\n\n"
+        
+            # Market Research Section  
+            if 'market' in sections:
+                market_data = sections['market']
+                content += f"""## � Market Research
+
+"""
+                if 'formatted_output' in market_data:
+                    content += f"{market_data['formatted_output']}\n\n"
+                elif market_data.get('output'):
+                    content += f"{market_data['output']}\n\n"
+        
+            # Financial Analysis Section
+            if 'financial' in sections:
+                fin_data = sections['financial']
+                content += f"""## 💰 Financial Analysis
+
+"""
+                if 'formatted_output' in fin_data:
+                    content += f"{fin_data['formatted_output']}\n\n"
+                elif fin_data.get('output'):
+                    content += f"{fin_data['output']}\n\n"
+        
+        # Legacy format support
+        else:
+            # Idea Validation Section
+            if 'validation' in data:
+                content += f"""## �🔍 Idea Validation
 
 {data['validation']}
 
 """
-        
-        # Market Research Section  
-        if 'market_research' in data:
-            content += f"""## 📊 Market Research
+            
+            # Market Research Section  
+            if 'market_research' in data:
+                content += f"""## 📊 Market Research
 
 {data['market_research']}
 
 """
-        
-        # Financial Analysis Section
-        if 'financial_analysis' in data:
-            content += f"""## 💰 Financial Analysis
+            
+            # Financial Analysis Section
+            if 'financial_analysis' in data:
+                content += f"""## 💰 Financial Analysis
 
 {data['financial_analysis']}
 
@@ -199,8 +272,19 @@ class ResearchDocumentManager:
 
 """
         
-        if 'analysis' in data:
+        # Check for the actual research output
+        if 'formatted_output' in data:
+            content += f"{data['formatted_output']}\n\n"
+        elif 'output' in data:
+            content += f"{data['output']}\n\n"
+        elif 'analysis' in data:
             content += f"{data['analysis']}\n\n"
+        else:
+            # Find the main content
+            for key, value in data.items():
+                if isinstance(value, str) and len(value) > 50:
+                    content += f"{value}\n\n"
+                    break
         
         if 'key_findings' in data:
             content += f"""### Key Findings
@@ -217,8 +301,19 @@ class ResearchDocumentManager:
 
 """
         
-        if 'market_analysis' in data:
+        # Check for the actual research output
+        if 'formatted_output' in data:
+            content += f"{data['formatted_output']}\n\n"
+        elif 'output' in data:
+            content += f"{data['output']}\n\n"
+        elif 'market_analysis' in data:
             content += f"{data['market_analysis']}\n\n"
+        else:
+            # Find the main content
+            for key, value in data.items():
+                if isinstance(value, str) and len(value) > 50:
+                    content += f"{value}\n\n"
+                    break
         
         if 'competitive_analysis' in data:
             content += f"""### Competitive Analysis
@@ -235,8 +330,19 @@ class ResearchDocumentManager:
 
 """
         
-        if 'financial_projections' in data:
+        # Check for the actual research output
+        if 'formatted_output' in data:
+            content += f"{data['formatted_output']}\n\n"
+        elif 'output' in data:
+            content += f"{data['output']}\n\n"
+        elif 'financial_projections' in data:
             content += f"{data['financial_projections']}\n\n"
+        else:
+            # Find the main content
+            for key, value in data.items():
+                if isinstance(value, str) and len(value) > 50:
+                    content += f"{value}\n\n"
+                    break
         
         if 'cost_analysis' in data:
             content += f"""### Cost Analysis
@@ -253,10 +359,21 @@ class ResearchDocumentManager:
 
 """
         
-        if 'analysis' in data:
+        # Check for the actual research output
+        if 'formatted_output' in data:
+            content += f"{data['formatted_output']}\n\n"
+        elif 'output' in data:
+            content += f"{data['output']}\n\n"
+        elif 'analysis' in data:
             content += f"{data['analysis']}\n\n"
         elif 'result' in data:
             content += f"{data['result']}\n\n"
+        else:
+            # If no specific field, try to find any text content
+            for key, value in data.items():
+                if isinstance(value, str) and len(value) > 50:  # Assume longer text is content
+                    content += f"{value}\n\n"
+                    break
         
         return content
     
